@@ -2,7 +2,9 @@
 
 import math
 import sqlite3
-from dataclasses import dataclass
+from collections import Counter
+from contextlib import closing
+from dataclasses import dataclass, replace
 from datetime import date
 from itertools import chain
 from pathlib import Path
@@ -16,6 +18,8 @@ PRICE_TYPES = {
     "specific amount": "Price for specific amount",
     "1ks": "Price per piece",
 }
+LEGACY_AMOUNT = """CASE WHEN weight_value IS NOT NULL
+    THEN trim(printf('%.15g', weight_value) || ' ' || coalesce(weight_unit, '')) END"""
 EXPORT_HEADERS = ("Product", "Price", "Type", "Amount", "Shop", "Date")
 
 
@@ -79,12 +83,10 @@ class Database:
             )}
             if "amount" not in columns:
                 self.connection.execute("ALTER TABLE price_history ADD COLUMN amount TEXT")
-                self.connection.execute("""
+                self.connection.execute(f"""
                     UPDATE price_history
                     SET price_type = 'specific amount',
-                        amount = CASE WHEN weight_value IS NOT NULL
-                                 THEN trim(printf('%.15g', weight_value) || ' ' ||
-                                           coalesce(weight_unit, '')) END
+                        amount = {LEGACY_AMOUNT}
                     WHERE price_type = 'specific weight'
                 """)
 
@@ -97,12 +99,12 @@ class Database:
             ORDER BY h.purchase_date DESC, h.id DESC
         """, (search_pattern(search),)).fetchall()
 
-    def is_duplicate(self, purchase):
+    def is_duplicate(self, purchase, exclude_id=None):
         return self.connection.execute("""
             SELECT 1 FROM price_history h JOIN products p ON h.product_id = p.id
             WHERE casefold(p.name) = ? AND h.price = ? AND casefold(h.shop_name) = ?
-                  AND h.purchase_date = ? LIMIT 1
-        """, purchase.duplicate_key).fetchone() is not None
+                  AND h.purchase_date = ? AND h.id IS NOT ? LIMIT 1
+        """, (*purchase.duplicate_key, exclude_id)).fetchone() is not None
 
     def duplicate_keys(self):
         return {tuple(row) for row in self.connection.execute("""
@@ -110,25 +112,86 @@ class Database:
             FROM price_history h JOIN products p ON p.id = h.product_id
         """)}
 
+    def product_id(self, name):
+        product = self.connection.execute("""
+            SELECT id FROM products WHERE casefold(name) = ? ORDER BY id LIMIT 1
+        """, (name.casefold(),)).fetchone()
+        if product:
+            return product["id"]
+        return self.connection.execute(
+            "INSERT INTO products(name) VALUES (?)", (name,)
+        ).lastrowid
+
+    def write_purchase(self, purchase, record_id=None, product_id=None):
+        if product_id is None:
+            product_id = self.product_id(purchase.product)
+        values = (product_id, purchase.price, purchase.price_type,
+                  purchase.amount, purchase.date.isoformat(), purchase.shop)
+        if record_id is None:
+            self.connection.execute("""
+                INSERT INTO price_history (
+                    product_id, price, price_type, amount, purchase_date, shop_name
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, values)
+        else:
+            self.connection.execute("""
+                UPDATE price_history
+                SET product_id = ?, price = ?, price_type = ?, amount = ?,
+                    purchase_date = ?, shop_name = ?
+                WHERE id = ?
+            """, (*values, record_id))
+
     def save(self, purchases):
         with self.connection:
             self.connection.execute("BEGIN IMMEDIATE")
             for purchase in purchases:
-                product = self.connection.execute("""
-                    SELECT id FROM products WHERE casefold(name) = ? ORDER BY id LIMIT 1
-                """, (purchase.product.casefold(),)).fetchone()
-                if product is None:
-                    product_id = self.connection.execute(
-                        "INSERT INTO products(name) VALUES (?)", (purchase.product,)
-                    ).lastrowid
+                self.write_purchase(purchase)
+
+    def edit(self, record_id, purchase):
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.write_purchase(purchase, record_id)
+
+    def edit_product_purchases(self, product_id, changes):
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            rows = self.connection.execute("""
+                SELECT h.id, p.name, h.price, h.price_type, h.amount,
+                       h.shop_name, h.purchase_date
+                FROM price_history h JOIN products p ON h.product_id = p.id
+                WHERE p.id = ?
+            """, (product_id,)).fetchall()
+            if not rows:
+                return 0
+            new_name = changes["product"]
+            target_id = product_id
+            if new_name != rows[0]["name"]:
+                if new_name.casefold() == rows[0]["name"].casefold():
+                    self.connection.execute("UPDATE products SET name = ? WHERE id = ?",
+                                            (new_name, product_id))
                 else:
-                    product_id = product["id"]
-                self.connection.execute("""
-                    INSERT INTO price_history (
-                        product_id, price, price_type, amount, purchase_date, shop_name
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                """, (product_id, purchase.price, purchase.price_type, purchase.amount,
-                      purchase.date.isoformat(), purchase.shop))
+                    target_id = self.product_id(new_name)
+            for row in rows:
+                purchase = replace(purchase_from_row(row), **changes)
+                self.write_purchase(purchase, row["id"], target_id)
+            if target_id != product_id:
+                self.connection.execute("DELETE FROM products WHERE id = ?", (product_id,))
+            return len(rows)
+
+    def import_database(self, path):
+        purchases = read_database(path)
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            remaining = Counter(import_key(purchase_from_row(row)) for row in self.records())
+            imported = 0
+            for purchase in purchases:
+                key = import_key(purchase)
+                if remaining[key]:
+                    remaining[key] -= 1
+                else:
+                    self.write_purchase(purchase)
+                    imported += 1
+        return imported, len(purchases) - imported
 
     def delete(self, record_id):
         with self.connection:
@@ -151,6 +214,53 @@ class Database:
 
     def close(self):
         self.connection.close()
+
+
+def purchase_from_row(row):
+    return Purchase(row["name"], row["price"], row["price_type"], row["amount"],
+                    row["shop_name"], date.fromisoformat(row["purchase_date"]))
+
+
+def import_key(purchase):
+    return purchase.duplicate_key, purchase.price_type, purchase.amount
+
+
+def read_database(path):
+    uri = Path(path).resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as source:
+        source.row_factory = sqlite3.Row
+        source.execute("PRAGMA trusted_schema = OFF")
+        source.execute("BEGIN")
+        tables = {row[0] for row in source.execute(
+            "SELECT name FROM sqlite_schema WHERE type = 'table'"
+        )}
+        if not {"products", "price_history"}.issubset(tables):
+            raise ValueError("Select a Grocery Price Tracker SQLite database.")
+        columns = {row["name"] for row in source.execute("PRAGMA table_info(price_history)")}
+        if "amount" in columns:
+            kind, amount = "h.price_type", "h.amount"
+        elif {"weight_value", "weight_unit"}.issubset(columns):
+            kind = "CASE h.price_type WHEN 'specific weight' THEN 'specific amount' ELSE h.price_type END"
+            amount = f"CASE WHEN h.price_type = 'specific weight' THEN {LEGACY_AMOUNT} END"
+        else:
+            raise ValueError("This purchase history database format is unsupported.")
+        rows = source.execute(f"""
+            SELECT p.name, h.price, {kind} AS price_type, {amount} AS amount,
+                   h.shop_name, h.purchase_date
+            FROM price_history h LEFT JOIN products p ON p.id = h.product_id
+            ORDER BY h.id
+        """)
+        purchases = []
+        for row in rows:
+            if (not isinstance(row["name"], str) or not row["name"].strip()
+                    or not isinstance(row["shop_name"], str) or not row["shop_name"].strip()
+                    or row["price_type"] not in PRICE_TYPES
+                    or (row["amount"] is not None and not isinstance(row["amount"], str))
+                    or not isinstance(row["purchase_date"], str)):
+                raise ValueError("The database contains an invalid purchase record.")
+            purchase = purchase_from_row(row)
+            purchases.append(replace(purchase, price=number(purchase.price, "Stored price")))
+        return purchases
 
 
 def search_pattern(search):

@@ -12,7 +12,8 @@ from zipfile import BadZipFile
 from openpyxl.utils.exceptions import InvalidFileException
 from xml.etree.ElementTree import ParseError
 
-from storage import Database, EXPORT_HEADERS, PRICE_TYPES, Purchase, export_excel, number, read_excel
+from storage import (Database, EXPORT_HEADERS, PRICE_TYPES, Purchase, export_excel, number,
+                     purchase_from_row, read_excel)
 
 RECORD_FIELDS = ("name", "price", "price_type", "amount",
                  "shop_name", "purchase_date")
@@ -124,37 +125,53 @@ class CalendarPicker(tk.Toplevel):
             row=8, column=0, columnspan=7, pady=(8, 0))
 
 
+KEEP_PRICE_TYPE = "Keep existing price type"
+
+
 class PurchaseForm(tk.Toplevel):
-    def __init__(self, app, original=None):
+    def __init__(self, app, original=None, *, mode="new", product_id=None, product_name=""):
         super().__init__(app.root)
         self.configure(background=BACKGROUND)
         self.app = app
         self.original = original
-        self.title("Update Purchase" if original else "New Purchase")
+        self.mode = mode
+        self.product_id = product_id
+        self.title({"new": "New Purchase", "update": "Update Purchase",
+                    "edit": "Edit Purchase", "bulk": "Edit Product Purchases"}[mode])
         self.transient(app.root)
         self.resizable(False, False)
         self.bind("<Escape>", lambda event: self.destroy())
         body = ttk.Frame(self, padding=20)
         body.grid(sticky="nsew")
-        self.product = tk.StringVar(value=original["name"] if original else "")
-        self.price = tk.StringVar()
-        self.kind = tk.StringVar(value=PRICE_TYPES["1kg"])
-        self.amount = tk.StringVar()
-        self.date = tk.StringVar(value=date.today().isoformat())
+        edit = mode == "edit"
+        bulk = mode == "bulk"
+        if bulk:
+            ttk.Label(body, text="Changes apply to all purchases for this product.\n"
+                                 "Leave price, date, and shop blank to keep their values.",
+                      padding=(0, 0, 0, 8)).grid(row=0, column=0, columnspan=2, sticky="w")
+        self.product = tk.StringVar(value=original["name"] if original else product_name)
+        self.price = tk.StringVar(value=str(original["price"]) if edit else "")
+        kind = PRICE_TYPES[original["price_type"]] if edit else PRICE_TYPES["1kg"]
+        self.kind = tk.StringVar(value=KEEP_PRICE_TYPE if bulk else kind)
+        self.amount = tk.StringVar(value=(original["amount"] or "") if edit else "")
+        default_date = original["purchase_date"] if edit else date.today().isoformat()
+        self.date = tk.StringVar(value="" if bulk else default_date)
         self.shop = tk.StringVar(value=original["shop_name"] if original else "")
 
         product_field = ttk.Entry(body, textvariable=self.product, width=32)
-        self.field(body, 0, "Product", product_field)
-        if original:
+        self.field(body, 1, "Product", product_field)
+        if mode == "update":
             product_field.state(["readonly"])
         price_field = ttk.Entry(body, textvariable=self.price)
-        self.field(body, 1, "New Price" if original else "Price", price_field)
-        if original is None:
-            kinds = ttk.Combobox(body, textvariable=self.kind, values=tuple(PRICE_TYPES.values()),
-                                 state="readonly")
-            self.field(body, 2, "Price Type", kinds)
+        self.field(body, 2, "New Price" if mode == "update" else "Price", price_field)
+        if mode != "update":
+            kinds = tuple(PRICE_TYPES.values())
+            if bulk:
+                kinds = (KEEP_PRICE_TYPE, *kinds)
+            kinds = ttk.Combobox(body, textvariable=self.kind, values=kinds, state="readonly")
+            self.field(body, 3, "Price Type", kinds)
             self.amount_field = ttk.Entry(body, textvariable=self.amount)
-            self.field(body, 3, "Amount", self.amount_field)
+            self.field(body, 4, "Amount", self.amount_field)
             kinds.bind("<<ComboboxSelected>>", self.toggle_amount)
             self.toggle_amount()
         date_field = ttk.Frame(body)
@@ -170,7 +187,7 @@ class PurchaseForm(tk.Toplevel):
         ttk.Button(actions, text="Save", command=self.save).pack(side="left")
         self.bind("<Return>", lambda event: self.save())
         self.grab_set()
-        (price_field if original else product_field).focus_set()
+        (price_field if mode == "update" else product_field).focus_set()
 
     @staticmethod
     def field(parent, row, label, widget):
@@ -181,45 +198,89 @@ class PurchaseForm(tk.Toplevel):
         enabled = self.kind.get() == PRICE_TYPES["specific amount"]
         self.amount_field.configure(state="normal" if enabled else "disabled")
 
+    def date_value(self):
+        raw_date = self.date.get().strip()
+        try:
+            purchase_date = date.fromisoformat(raw_date)
+            if purchase_date.isoformat() == raw_date:
+                return purchase_date
+        except ValueError:
+            pass
+        raise ValueError("Enter a valid date in YYYY-MM-DD format.")
+
+    def type_and_amount(self):
+        kind = next(code for code, label in PRICE_TYPES.items() if label == self.kind.get())
+        amount = None
+        if kind == "specific amount":
+            amount = self.amount.get()
+            if not amount.strip():
+                if (self.mode == "edit" and self.original["price_type"] == kind
+                        and self.original["amount"] is None):
+                    return kind, None
+                raise ValueError("Enter an amount.")
+        return kind, amount
+
     def purchase(self):
         product, shop = self.product.get().strip(), self.shop.get().strip()
         if not product or not shop:
             raise ValueError("Enter both a product and a shop.")
-        price = number(self.price.get(), "Price")
-        raw_date = self.date.get().strip()
-        try:
-            purchase_date = date.fromisoformat(raw_date)
-            if purchase_date.isoformat() != raw_date:
-                raise ValueError
-        except ValueError:
-            raise ValueError("Enter a valid date in YYYY-MM-DD format.") from None
-        amount = None
-        if self.original:
-            kind = self.original["price_type"]
-            amount = self.original["amount"]
+        if self.mode == "update":
+            kind, amount = self.original["price_type"], self.original["amount"]
         else:
-            kind = next(code for code, label in PRICE_TYPES.items() if label == self.kind.get())
-            if kind == "specific amount":
-                amount = self.amount.get()
-                if not amount.strip():
-                    raise ValueError("Enter an amount.")
-        return Purchase(product, price, kind, amount, shop, purchase_date)
+            kind, amount = self.type_and_amount()
+        return Purchase(product, number(self.price.get(), "Price"), kind, amount,
+                        shop, self.date_value())
+
+    def bulk_changes(self):
+        product = self.product.get().strip()
+        if not product:
+            raise ValueError("Enter a product name.")
+        changes = {"product": product}
+        if self.price.get().strip():
+            changes["price"] = number(self.price.get(), "Price")
+        if self.date.get().strip():
+            changes["date"] = self.date_value()
+        if self.shop.get().strip():
+            changes["shop"] = self.shop.get().strip()
+        if self.kind.get() != KEEP_PRICE_TYPE:
+            changes["price_type"], changes["amount"] = self.type_and_amount()
+        return changes
 
     def save(self):
         try:
-            purchase = self.purchase()
-            if self.app.db.is_duplicate(purchase) and not messagebox.askyesno(
-                "Possible duplicate detected", "Possible duplicate detected.\nSave anyway?",
-                parent=self, default="no"
-            ):
-                return
-            self.app.db.save([purchase])
+            if self.mode == "bulk":
+                changes = self.bulk_changes()
+                if not messagebox.askyesno(
+                    "Edit Product Purchases", "Apply these changes to all purchases of this product?",
+                    parent=self, default="no",
+                ):
+                    return
+                count = self.app.db.edit_product_purchases(self.product_id, changes)
+                status = f"Edited {count:,} purchase record(s)."
+            else:
+                purchase = self.purchase()
+                record_id = self.original["id"] if self.mode == "edit" else None
+                check_duplicate = record_id is None or (
+                    purchase.duplicate_key != purchase_from_row(self.original).duplicate_key
+                )
+                if check_duplicate and self.app.db.is_duplicate(purchase, record_id):
+                    if not messagebox.askyesno(
+                        "Possible duplicate detected", "Possible duplicate detected.\nSave anyway?",
+                        parent=self, default="no",
+                    ):
+                        return
+                if record_id is None:
+                    self.app.db.save([purchase])
+                    status = "Purchase saved."
+                else:
+                    self.app.db.edit(record_id, purchase)
+                    status = "Purchase edited."
         except (ValueError, sqlite3.Error) as error:
             messagebox.showerror("Could not save purchase", str(error), parent=self)
             return
         self.destroy()
         self.app.refresh()
-        self.app.status.set("Purchase saved.")
+        self.app.status.set(status)
 
 
 class Tracker:
@@ -240,8 +301,8 @@ class Tracker:
             anchor="w", pady=(0, 10))
         for label, command in (
             ("New Purchase", lambda: PurchaseForm(self)),
-            ("Search Purchases", lambda: self.show_records(search=True)),
-            ("Display All Records", self.show_records),
+            ("Search Purchases", self.show_records),
+            ("Import Database", self.import_database),
             ("Import Excel", self.import_workbook),
             ("Export Excel", self.export_workbook),
             ("Statistics", self.show_statistics),
@@ -288,10 +349,10 @@ class Tracker:
         field.pack(side="left", padx=8)
         return controls, query, field
 
-    def show_records(self, search=False):
+    def show_records(self):
         self.clear()
         self.status.set("")
-        ttk.Label(self.body, text="Search Purchases" if search else "All Records",
+        ttk.Label(self.body, text="Search Purchases",
                   font=("TkDefaultFont", 13, "bold")).pack(anchor="w", pady=(0, 8))
         controls, query, field = self.search_bar()
         tree = self.table(self.body, RECORD_HEADERS, (195, 85, 190, 135, 135, 105))
@@ -338,10 +399,10 @@ class Tracker:
                 tree.see(selected[0])
             self.status.set(f"{len(rows):,} record(s)")
 
-        def update():
+        def open_form(mode):
             selected = tree.selection()
             if selected:
-                PurchaseForm(self, records[selected[0]])
+                PurchaseForm(self, records[selected[0]], mode=mode)
 
         def delete():
             selected = tree.selection()
@@ -358,10 +419,11 @@ class Tracker:
                                    state="disabled")
         delete_button.pack(side="right")
         buttons = [delete_button]
-        if search:
-            update_button = ttk.Button(controls, text="Update", command=update, state="disabled")
-            update_button.pack(side="right", padx=6)
-            buttons.append(update_button)
+        for label in ("Update", "Edit"):
+            button = ttk.Button(controls, text=label, command=lambda mode=label.lower(): open_form(mode),
+                                state="disabled")
+            button.pack(side="right", padx=6)
+            buttons.append(button)
 
         def selection_changed(event):
             state = "normal" if tree.selection() else "disabled"
@@ -373,8 +435,7 @@ class Tracker:
         query.trace_add("write", lambda *_: populate())
         self.refresh = populate
         populate()
-        if search:
-            field.focus_set()
+        field.focus_set()
 
     def show_statistics(self):
         self.clear()
@@ -382,7 +443,7 @@ class Tracker:
             anchor="w")
         ttk.Label(self.body, text="Double-click a product to see its ten most recent prices.").pack(
             anchor="w", pady=(4, 8))
-        _, query, field = self.search_bar()
+        controls, query, field = self.search_bar()
         tree = self.table(self.body, ("Product", "Lowest Price", "Highest Price",
                                      "Average Price", "Number of Records"),
                           (230, 135, 135, 135, 150))
@@ -404,6 +465,18 @@ class Tracker:
             if item:
                 self.show_recent_prices(int(item), tree.set(item, "Product"))
 
+        def edit_product():
+            selected = tree.selection()
+            if selected:
+                item = selected[0]
+                PurchaseForm(self, mode="bulk", product_id=int(item),
+                             product_name=tree.set(item, "Product"))
+
+        edit_button = ttk.Button(controls, text="Edit", command=edit_product, state="disabled")
+        edit_button.pack(side="right")
+        tree.bind("<<TreeviewSelect>>", lambda event: edit_button.configure(
+            state="normal" if tree.selection() else "disabled"
+        ))
         tree.bind("<Double-1>", open_recent)
         tree.bind("<Return>", open_recent)
         query.trace_add("write", lambda *_: populate())
@@ -428,6 +501,24 @@ class Tracker:
         window.bind("<Escape>", lambda event: window.destroy())
         window.grab_set()
         tree.focus_set()
+
+    def import_database(self):
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Import Grocery Price Tracker Database",
+            filetypes=[("SQLite databases", ("*.sqlite3", "*.sqlite", "*.db")), ("All files", "*")],
+        )
+        if not path:
+            return
+        try:
+            imported, skipped = self.db.import_database(path)
+        except (OSError, sqlite3.Error, ValueError) as error:
+            messagebox.showerror("Database import failed",
+                                 f"No purchases were imported.\n\n{error}", parent=self.root)
+            return
+        self.refresh()
+        messagebox.showinfo("Database import complete",
+                            f"Imported {imported:,} purchase record(s).\n"
+                            f"Already present: {skipped:,}.", parent=self.root)
 
     def import_workbook(self):
         path = filedialog.askopenfilename(parent=self.root, title="Import Excel",

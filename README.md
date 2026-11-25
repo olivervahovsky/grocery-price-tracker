@@ -10,20 +10,29 @@ interface and stores purchases locally in SQLite.
   Choose price per kilogram, price per piece, or price for a specific amount.
   The amount is free text, so you can enter values such as `500g`, `250ml`,
   `6ks`, or `285g/157g`.
-- **Find and manage purchases.** Search by part of a product name, ignoring
-  case. Sort the records by clicking a column header. Delete individual
-  records after confirming the selection.
+- **Find and manage purchases.** Search Purchases shows the full history when
+  the search box is empty. Filter by part of a product name, sort by clicking
+  a column header, or delete a selected record after confirming.
+- **Correct a record.** Select a record in Search Purchases and click **Edit**
+  to change its fields in place. Use **Update** to add a new price to history.
 - **Keep price history.** Updating a purchase adds a new record with the
   new price, shop, and date. It copies the selected record’s price type and
   amount and keeps the earlier record in history.
 - **Review statistics.** Search products and see their minimum, maximum,
   average, and record count. Double-click a product to view its ten most
   recent prices and purchase dates. Statistics use recorded prices across
-  all price types without unit conversion.
+  all price types without unit conversion. Select a product and click **Edit**
+  to change its name or apply shared values to its purchases. Blank price,
+  date, and shop fields retain each record’s values. Choose **Keep existing
+  price type** to retain each record’s price type and amount.
 - **Exchange data with Excel.** Import multiple prices per product row or
   export the full history to `PriceHistory.xlsx`.
 
-## Build and run on Windows 11
+## Download or build on Windows 11
+
+See [GitHub Releases](https://github.com/olivervahovsky/grocery-price-tracker/releases)
+for the latest version. Download and extract the release source archive to
+build the executable.
 
 1. Install Python 3.12 with Tcl/Tk and the Windows Python launcher. If you use
    Python Install Manager, run `py install 3.12`.
@@ -68,3 +77,11 @@ values become amount text, such as `250 g`.
 
 To back up the history, close the app and copy the database file. To restore it,
 close the app and replace the database file with your backup.
+
+Use **Import Database** to bring purchase history from a previous
+Grocery Price Tracker `.sqlite3` file into the current app. It adds purchases
+while retaining the history already in the current database and reading the
+source without modifying it. It supports the original weight-and-unit format
+and the newer amount format, and preserves the original dates, shops, and
+prices. Already-present entries are counted using all purchase fields, so
+re-importing an unchanged database does not add another copy of its history.
