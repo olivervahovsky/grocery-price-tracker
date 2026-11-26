@@ -12,6 +12,7 @@ from zipfile import BadZipFile
 from openpyxl.utils.exceptions import InvalidFileException
 from xml.etree.ElementTree import ParseError
 
+from autocomplete import SuggestionEntry
 from storage import (Database, EXPORT_HEADERS, PRICE_TYPES, Purchase, export_excel, number,
                      purchase_from_row, read_excel)
 
@@ -55,6 +56,42 @@ def apply_dark_theme(root):
     style.map("Treeview.Heading", background=[("active", HOVER)])
     style.configure("TScrollbar", background=BORDER, arrowcolor=TEXT)
     style.map("TScrollbar", background=[("active", ACCENT)])
+
+
+
+PRICE_CODES = {label: code for code, label in PRICE_TYPES.items()}
+
+
+def suggested_entry(parent, db, field, variable, **kwargs):
+    return SuggestionEntry(parent, variable, lambda text: db.suggestions(field, text),
+                           (SURFACE, TEXT, ACCENT, BORDER), **kwargs)
+
+
+def parse_purchase_date(value):
+    raw_date = value.strip()
+    try:
+        purchase_date = date.fromisoformat(raw_date)
+        if purchase_date.isoformat() == raw_date:
+            return purchase_date
+    except ValueError:
+        pass
+    raise ValueError("Enter a valid date in YYYY-MM-DD format.")
+
+
+def amount_for_type(kind, amount):
+    if kind != "specific amount":
+        return None
+    if not amount.strip():
+        raise ValueError("Enter an amount.")
+    return amount
+
+
+def date_input(parent, dialog, db, variable):
+    frame = ttk.Frame(parent)
+    suggested_entry(frame, db, "date", variable, width=14).pack(side="left")
+    ttk.Button(frame, text="Calendar…", command=lambda: CalendarPicker(
+        dialog, variable)).pack(side="left", padx=(6, 0))
+    return frame
 
 
 
@@ -125,19 +162,206 @@ class CalendarPicker(tk.Toplevel):
             row=8, column=0, columnspan=7, pady=(8, 0))
 
 
+class PurchaseItem:
+    def __init__(self, parent, db, index, remove):
+        self.frame = ttk.Frame(parent)
+        self.frame.pack(fill="x", pady=(0, 5))
+        self.frame.columnconfigure(1, weight=2)
+        self.frame.columnconfigure(4, weight=1)
+        self.product = tk.StringVar()
+        self.price = tk.StringVar()
+        self.kind = tk.StringVar(value=PRICE_TYPES["1kg"])
+        self.amount = tk.StringVar()
+
+        self.label = ttk.Label(self.frame, text=str(index), width=3)
+        self.label.grid(row=0, column=0, sticky="w")
+        self.product_field = suggested_entry(self.frame, db, "product", self.product, width=24)
+        price_field = suggested_entry(self.frame, db, "price", self.price, width=11)
+        kinds = ttk.Combobox(self.frame, textvariable=self.kind, values=tuple(PRICE_CODES),
+                             state="readonly", width=24)
+        self.amount_field = suggested_entry(self.frame, db, "amount", self.amount, width=14,
+                                            state="disabled")
+        self.remove_button = ttk.Button(self.frame, text="Remove", command=lambda: remove(self))
+        for column, field in enumerate(
+            (self.product_field, price_field, kinds, self.amount_field, self.remove_button), 1
+        ):
+            field.grid(row=0, column=column, sticky="ew", padx=(0, 6))
+        kinds.bind("<<ComboboxSelected>>", self.toggle_amount)
+
+    def toggle_amount(self, event=None):
+        if self.kind.get() == PRICE_TYPES["specific amount"]:
+            self.amount_field.state(["!disabled"])
+        else:
+            self.amount_field.state(["disabled"])
+
+    def purchase(self, shop, purchase_date):
+        product, price = self.product.get().strip(), self.price.get().strip()
+        kind = PRICE_CODES[self.kind.get()]
+        if not product and not price and kind == "1kg" and not self.amount.get().strip():
+            return None
+        if not product:
+            raise ValueError("Enter a product name.")
+        return Purchase(product, number(price, "Price"), kind,
+                        amount_for_type(kind, self.amount.get()), shop, purchase_date)
+
+
+class NewPurchase(tk.Toplevel):
+    def __init__(self, app):
+        super().__init__(app.root, background=BACKGROUND)
+        self.app = app
+        self.items = []
+        self.title("New Purchase")
+        self.transient(app.root)
+        self.geometry("900x475")
+        self.minsize(800, 320)
+        self.bind("<Escape>", lambda event: self.destroy())
+        self.shop = tk.StringVar()
+        self.date = tk.StringVar(value=date.today().isoformat())
+
+        body = ttk.Frame(self, padding=16)
+        body.pack(fill="both", expand=True)
+        details = ttk.Frame(body)
+        details.pack(fill="x", pady=(0, 14))
+        ttk.Label(details, text="Shop").pack(side="left", padx=(0, 8))
+        shop = suggested_entry(details, app.db, "shop", self.shop, width=26)
+        shop.pack(side="left", padx=(0, 22))
+        ttk.Label(details, text="Date (YYYY-MM-DD)").pack(side="left", padx=(0, 8))
+        date_input(details, self, app.db, self.date).pack(side="left")
+
+        actions = ttk.Frame(body)
+        actions.pack(side="bottom", fill="x", pady=(10, 0))
+        ttk.Button(actions, text="+ Add Item", command=self.add_item).pack(side="left")
+        ttk.Button(actions, text="Done", command=self.done).pack(side="right")
+        ttk.Button(actions, text="Cancel", command=self.destroy).pack(side="right", padx=8)
+
+        ttk.Label(body, text="For each item, enter its product, price, price type, and amount if applicable.").pack(
+            anchor="w", pady=(0, 6)
+        )
+        area = ttk.Frame(body)
+        area.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(area, background=BACKGROUND, highlightthickness=0)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(area, orient="vertical", command=self.scroll)
+        scrollbar.pack(side="right", fill="y")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.rows = ttk.Frame(self.canvas)
+        self.rows_window = self.canvas.create_window(0, 0, window=self.rows, anchor="nw")
+        self.canvas.bind("<Configure>", lambda event: self.canvas.itemconfigure(
+            self.rows_window, width=event.width
+        ))
+        self.rows.bind("<Configure>", lambda event: self.canvas.configure(
+            scrollregion=self.canvas.bbox("all")
+        ))
+        self.bind("<MouseWheel>", self.wheel)
+        self.bind("<Button-4>", self.wheel)
+        self.bind("<Button-5>", self.wheel)
+        self.add_item(focus=False)
+        self.grab_set()
+        shop.focus_set()
+
+    def scroll(self, *args):
+        focused = self.focus_get()
+        if isinstance(focused, SuggestionEntry):
+            focused.hide()
+        self.canvas.yview(*args)
+
+    def wheel(self, event):
+        if event.num in (4, 5):
+            steps = -1 if event.num == 4 else 1
+        else:
+            steps = -max(1, abs(event.delta) // 120) if event.delta > 0 else max(1, abs(event.delta) // 120)
+        self.scroll("scroll", steps, "units")
+
+    def add_item(self, focus=True):
+        item = PurchaseItem(self.rows, self.app.db, len(self.items) + 1, self.remove_item)
+        self.items.append(item)
+        for field in item.frame.winfo_children():
+            field.bind("<FocusIn>", lambda event, row=item.frame: self.reveal(row), add=True)
+        self.update_remove_buttons()
+        if focus:
+            self.update_idletasks()
+            item.product_field.focus_set()
+            self.reveal(item.frame)
+
+    def reveal(self, row):
+        height = self.rows.winfo_height()
+        if height <= 1:
+            return
+        top = self.canvas.canvasy(0)
+        viewport = self.canvas.winfo_height()
+        start, end = row.winfo_y(), row.winfo_y() + row.winfo_height()
+        if start < top:
+            self.scroll("moveto", start / height)
+        elif end > top + viewport:
+            self.scroll("moveto", (end - viewport + 5) / height)
+
+    def remove_item(self, item):
+        self.items.remove(item)
+        item.frame.destroy()
+        for index, remaining in enumerate(self.items, 1):
+            remaining.label.configure(text=str(index))
+        self.update_remove_buttons()
+
+    def update_remove_buttons(self):
+        state = "normal" if len(self.items) > 1 else "disabled"
+        for item in self.items:
+            item.remove_button.configure(state=state)
+
+    def done(self):
+        try:
+            shop = self.shop.get().strip()
+            if not shop:
+                raise ValueError("Enter a shop.")
+            purchase_date = parse_purchase_date(self.date.get())
+            purchases = []
+            for index, item in enumerate(self.items, 1):
+                try:
+                    purchase = item.purchase(shop, purchase_date)
+                except ValueError as error:
+                    raise ValueError(f"Item {index}: {error}") from error
+                if purchase is not None:
+                    purchases.append((index, purchase))
+            if not purchases:
+                raise ValueError("Enter at least one item.")
+
+            known = self.app.db.duplicate_keys()
+            accepted = []
+            for index, purchase in purchases:
+                key = purchase.duplicate_key
+                if key in known and not messagebox.askyesno(
+                    "Possible duplicate detected",
+                    f"Item {index}: {purchase.product} · {purchase.price:.2f}\n"
+                    "Possible duplicate detected. Save anyway?",
+                    parent=self, default="no",
+                ):
+                    continue
+                accepted.append(purchase)
+                known.add(key)
+            if not accepted:
+                return
+            self.app.db.save(accepted)
+        except (ValueError, sqlite3.Error) as error:
+            messagebox.showerror("Could not save purchase", str(error), parent=self)
+            return
+
+        self.destroy()
+        self.app.refresh()
+        self.app.status.set(f"Saved {len(accepted):,} of {len(purchases):,} item(s).")
+
+
 KEEP_PRICE_TYPE = "Keep existing price type"
 
 
 class PurchaseForm(tk.Toplevel):
-    def __init__(self, app, original=None, *, mode="new", product_id=None, product_name=""):
+    def __init__(self, app, original=None, *, mode, product_id=None, product_name=""):
         super().__init__(app.root)
         self.configure(background=BACKGROUND)
         self.app = app
         self.original = original
         self.mode = mode
         self.product_id = product_id
-        self.title({"new": "New Purchase", "update": "Update Purchase",
-                    "edit": "Edit Purchase", "bulk": "Edit Product Purchases"}[mode])
+        self.title({"update": "Update Purchase", "edit": "Edit Purchase",
+                    "bulk": "Edit Product Purchases"}[mode])
         self.transient(app.root)
         self.resizable(False, False)
         self.bind("<Escape>", lambda event: self.destroy())
@@ -158,11 +382,11 @@ class PurchaseForm(tk.Toplevel):
         self.date = tk.StringVar(value="" if bulk else default_date)
         self.shop = tk.StringVar(value=original["shop_name"] if original else "")
 
-        product_field = ttk.Entry(body, textvariable=self.product, width=32)
+        product_field = suggested_entry(body, app.db, "product", self.product, width=32)
         self.field(body, 1, "Product", product_field)
         if mode == "update":
             product_field.state(["readonly"])
-        price_field = ttk.Entry(body, textvariable=self.price)
+        price_field = suggested_entry(body, app.db, "price", self.price)
         self.field(body, 2, "New Price" if mode == "update" else "Price", price_field)
         if mode != "update":
             kinds = tuple(PRICE_TYPES.values())
@@ -170,16 +394,12 @@ class PurchaseForm(tk.Toplevel):
                 kinds = (KEEP_PRICE_TYPE, *kinds)
             kinds = ttk.Combobox(body, textvariable=self.kind, values=kinds, state="readonly")
             self.field(body, 3, "Price Type", kinds)
-            self.amount_field = ttk.Entry(body, textvariable=self.amount)
+            self.amount_field = suggested_entry(body, app.db, "amount", self.amount)
             self.field(body, 4, "Amount", self.amount_field)
             kinds.bind("<<ComboboxSelected>>", self.toggle_amount)
             self.toggle_amount()
-        date_field = ttk.Frame(body)
-        ttk.Entry(date_field, textvariable=self.date, width=14).pack(side="left")
-        ttk.Button(date_field, text="Calendar…", command=lambda: CalendarPicker(
-            self, self.date)).pack(side="left", padx=(6, 0))
-        self.field(body, 5, "Date (YYYY-MM-DD)", date_field)
-        self.field(body, 6, "Shop", ttk.Entry(body, textvariable=self.shop))
+        self.field(body, 5, "Date (YYYY-MM-DD)", date_input(body, self, app.db, self.date))
+        self.field(body, 6, "Shop", suggested_entry(body, app.db, "shop", self.shop))
 
         actions = ttk.Frame(body)
         actions.grid(row=7, column=0, columnspan=2, sticky="e", pady=(14, 0))
@@ -198,27 +418,13 @@ class PurchaseForm(tk.Toplevel):
         enabled = self.kind.get() == PRICE_TYPES["specific amount"]
         self.amount_field.configure(state="normal" if enabled else "disabled")
 
-    def date_value(self):
-        raw_date = self.date.get().strip()
-        try:
-            purchase_date = date.fromisoformat(raw_date)
-            if purchase_date.isoformat() == raw_date:
-                return purchase_date
-        except ValueError:
-            pass
-        raise ValueError("Enter a valid date in YYYY-MM-DD format.")
-
     def type_and_amount(self):
-        kind = next(code for code, label in PRICE_TYPES.items() if label == self.kind.get())
-        amount = None
-        if kind == "specific amount":
-            amount = self.amount.get()
-            if not amount.strip():
-                if (self.mode == "edit" and self.original["price_type"] == kind
-                        and self.original["amount"] is None):
-                    return kind, None
-                raise ValueError("Enter an amount.")
-        return kind, amount
+        kind = PRICE_CODES[self.kind.get()]
+        amount = self.amount.get()
+        if (kind == "specific amount" and not amount.strip() and self.mode == "edit"
+                and self.original["price_type"] == kind and self.original["amount"] is None):
+            return kind, None
+        return kind, amount_for_type(kind, amount)
 
     def purchase(self):
         product, shop = self.product.get().strip(), self.shop.get().strip()
@@ -229,7 +435,7 @@ class PurchaseForm(tk.Toplevel):
         else:
             kind, amount = self.type_and_amount()
         return Purchase(product, number(self.price.get(), "Price"), kind, amount,
-                        shop, self.date_value())
+                        shop, parse_purchase_date(self.date.get()))
 
     def bulk_changes(self):
         product = self.product.get().strip()
@@ -239,7 +445,7 @@ class PurchaseForm(tk.Toplevel):
         if self.price.get().strip():
             changes["price"] = number(self.price.get(), "Price")
         if self.date.get().strip():
-            changes["date"] = self.date_value()
+            changes["date"] = parse_purchase_date(self.date.get())
         if self.shop.get().strip():
             changes["shop"] = self.shop.get().strip()
         if self.kind.get() != KEEP_PRICE_TYPE:
@@ -300,7 +506,7 @@ class Tracker:
         ttk.Label(header, text="Grocery Price Tracker", font=("TkDefaultFont", 18, "bold")).pack(
             anchor="w", pady=(0, 10))
         for label, command in (
-            ("New Purchase", lambda: PurchaseForm(self)),
+            ("New Purchase", lambda: NewPurchase(self)),
             ("Search Purchases", self.show_records),
             ("Import Database", self.import_database),
             ("Import Excel", self.import_workbook),
@@ -345,7 +551,7 @@ class Tracker:
         controls.pack(fill="x")
         query = tk.StringVar()
         ttk.Label(controls, text="Product").pack(side="left")
-        field = ttk.Entry(controls, textvariable=query, width=26)
+        field = suggested_entry(controls, self.db, "product", query, width=26)
         field.pack(side="left", padx=8)
         return controls, query, field
 

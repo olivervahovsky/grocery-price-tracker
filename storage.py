@@ -99,6 +99,29 @@ class Database:
             ORDER BY h.purchase_date DESC, h.id DESC
         """, (search_pattern(search),)).fetchall()
 
+    def suggestions(self, field, text):
+        fields = {
+            "product": "p.name",
+            "shop": "h.shop_name",
+            "amount": "h.amount",
+            "price": "CAST(h.price AS TEXT)",
+            "date": "h.purchase_date",
+        }
+        column = fields[field]
+        query = text.strip()
+        if not query:
+            return []
+        if field == "price":
+            query = query.replace(",", ".")
+        return [row[0] for row in self.connection.execute(f"""
+            SELECT MIN({column}) AS value
+            FROM price_history h JOIN products p ON h.product_id = p.id
+            WHERE {column} IS NOT NULL AND casefold({column}) LIKE ? ESCAPE '!'
+            GROUP BY casefold({column})
+            ORDER BY instr(casefold(value), ?), casefold(value)
+            LIMIT 8
+        """, (search_pattern(query), query.casefold()))]
+
     def is_duplicate(self, purchase, exclude_id=None):
         return self.connection.execute("""
             SELECT 1 FROM price_history h JOIN products p ON h.product_id = p.id

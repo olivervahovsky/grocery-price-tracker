@@ -6,10 +6,15 @@ interface and stores purchases locally in SQLite.
 
 ## What you can do
 
-- **Record a purchase.** Enter a product, price, shop, and purchase date.
-  Choose price per kilogram, price per piece, or price for a specific amount.
-  The amount is free text, so you can enter values such as `500g`, `250ml`,
-  `6ks`, or `285g/157g`.
+- **Record a shopping trip.** In **New Purchase**, enter the shop and date
+  once. Click **Add Item** to enter more groceries and review or remove
+  rows before clicking **Done**. Each item is saved as a price record
+  with the same shop and date. You can choose price per kilogram, price
+  per piece, or a free-text amount such as `500g`, `250ml`, or `6ks`.
+- **Reuse saved values.** The app suggests matches as you type in
+  product, shop, amount, price, and date fields. Each field suggests
+  values from its own part of the purchase history. Click a suggestion
+  or use the arrow keys and Enter. You can also enter a new value.
 - **Find and manage purchases.** Search Purchases shows the full history when
   the search box is empty. Filter by part of a product name, sort by clicking
   a column header, or delete a selected record after confirming.
@@ -31,8 +36,8 @@ interface and stores purchases locally in SQLite.
 ## Download or build on Windows 11
 
 See [GitHub Releases](https://github.com/olivervahovsky/grocery-price-tracker/releases)
-for the latest version. Download and extract the release source archive to
-build the executable.
+for the latest Windows executable. The release also includes a source
+archive if you prefer to build it yourself.
 
 1. Install Python 3.12 with Tcl/Tk and the Windows Python launcher. If you use
    Python Install Manager, run `py install 3.12`.
@@ -62,8 +67,8 @@ from column D onward creates a separate record dated today. Paste formula
 results as values before importing.
 
 The app asks whether to keep a possible duplicate when product, price, shop,
-and date match. This also applies to records accepted earlier in the same
-workbook. Choosing **No** skips that price and continues the import.
+and date match. This also applies to entries accepted earlier in the same
+shopping trip or Excel workbook. Choosing **No** skips that item.
 
 Export includes **Product**, **Price**, **Type**, **Amount**, **Shop**, and
 **Date**. Import expects the layout shown above.
